@@ -102,10 +102,20 @@ def test_model(model, dataset, text_samples):
     model.eval()
     
     print("\nTesting model on sample inputs:")
+    print("-" * 50)
     for text in text_samples:
         restored = restore_diacritics(model, text, dataset, device)
-        print(f"Input:  {text}")
-        print(f"Output: {restored}\n")
+        print(f"Input:    {text}")
+        print(f"Restored: {restored}")
+        
+        # Highlight changes
+        changes = []
+        for orig, rest in zip(text, restored):
+            if orig != rest:
+                changes.append(f"{orig}→{rest}")
+        if changes:
+            print(f"Changes:  {', '.join(changes)}")
+        print("-" * 50)
 
 if __name__ == "__main__":
     # Example usage
