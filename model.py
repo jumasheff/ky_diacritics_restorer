@@ -1,19 +1,43 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+from typing import List, Dict, Tuple, Optional
+import math
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor, shape [seq_len, batch_size, embedding_dim]
+        """
+        return x + self.pe[:x.size(0)]
 
 class KyrgyzTextDataset(Dataset):
-    pad_idx = None  # This will be set in __init__
-    
-    def __init__(self, file_path):
+    def __init__(self, file_path: str, max_len: int = 512):
         self.input_texts = []
         self.target_texts = []
+        self.max_len = max_len
         
-        # Create character to index mappings
-        self.char_to_idx = {}
-        self.idx_to_char = {}
+        # Special tokens
+        self.special_tokens = ['<PAD>', '<UNK>', '<BOS>', '<EOS>']
+        self.char_to_idx = {token: idx for idx, token in enumerate(self.special_tokens)}
+        self.idx_to_char = {idx: token for idx, token in enumerate(self.special_tokens)}
+        
+        self.pad_idx = self.char_to_idx['<PAD>']
+        self.unk_idx = self.char_to_idx['<UNK>']
+        self.bos_idx = self.char_to_idx['<BOS>']
+        self.eos_idx = self.char_to_idx['<EOS>']
         
         # Read data and build vocabulary
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -22,179 +46,180 @@ class KyrgyzTextDataset(Dataset):
                 if '\t' in line:
                     fields = line.strip().split('\t')
                     if len(fields) >= 2:
-                        target = fields[1].strip().lower()  # Convert to lowercase
-                        input_text = fields[2].strip().lower() if len(fields) > 2 else target  # Convert to lowercase
-                        self.input_texts.append(input_text)
-                        self.target_texts.append(target.lower())  # Convert to lowercase
+                        target = fields[1].strip().lower()
+                        input_text = fields[2].strip().lower() if len(fields) > 2 else target
                         
-                        # Update vocabulary (only lowercase)
-                        for char in input_text + target:
-                            if char not in self.char_to_idx:
-                                idx = len(self.char_to_idx)
-                                self.char_to_idx[char] = idx
-                                self.idx_to_char[idx] = char
+                        if len(input_text) <= max_len - 2:  # -2 for BOS and EOS
+                            self.input_texts.append(input_text)
+                            self.target_texts.append(target)
+                            
+                            # Update vocabulary
+                            for char in input_text + target:
+                                if char not in self.char_to_idx:
+                                    idx = len(self.char_to_idx)
+                                    self.char_to_idx[char] = idx
+                                    self.idx_to_char[idx] = char
         
         self.vocab_size = len(self.char_to_idx)
-        self.pad_idx = self.vocab_size
-        KyrgyzTextDataset.pad_idx = self.vocab_size
-        self.char_to_idx['<PAD>'] = self.pad_idx
-        self.idx_to_char[self.pad_idx] = '<PAD>'
     
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.input_texts)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         input_text = self.input_texts[idx]
         target_text = self.target_texts[idx]
         
-        # Convert to indices
-        input_indices = [self.char_to_idx[c] for c in input_text]
-        target_indices = [self.char_to_idx[c] for c in target_text]
-        
-        return torch.tensor(input_indices, dtype=torch.long), torch.tensor(target_indices, dtype=torch.long)
-
-    @staticmethod
-    def collate_fn(batch):
-        # Separate inputs and targets
-        inputs, targets = zip(*batch)
-        
-        # Get max lengths
-        input_lengths = [len(x) for x in inputs]
-        target_lengths = [len(x) for x in targets]
-        max_input_len = max(input_lengths)
-        max_target_len = max(target_lengths)
+        # Convert to indices with BOS and EOS tokens
+        input_indices = [self.bos_idx] + [self.char_to_idx.get(c, self.unk_idx) for c in input_text] + [self.eos_idx]
+        target_indices = [self.bos_idx] + [self.char_to_idx.get(c, self.unk_idx) for c in target_text] + [self.eos_idx]
         
         # Pad sequences
-        padded_inputs = torch.full((len(batch), max_input_len), KyrgyzTextDataset.pad_idx, dtype=torch.long)
-        padded_targets = torch.full((len(batch), max_target_len), KyrgyzTextDataset.pad_idx, dtype=torch.long)
+        input_indices = input_indices + [self.pad_idx] * (self.max_len - len(input_indices))
+        target_indices = target_indices + [self.pad_idx] * (self.max_len - len(target_indices))
         
-        for i, (input, target) in enumerate(zip(inputs, targets)):
-            padded_inputs[i, :len(input)] = input
-            padded_targets[i, :len(target)] = target
-        
-        return padded_inputs, padded_targets
+        return (torch.tensor(input_indices[:self.max_len], dtype=torch.long),
+                torch.tensor(target_indices[:self.max_len], dtype=torch.long))
 
-class Encoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size + 1, embedding_dim)  # +1 for padding
-        self.rnn = nn.LSTM(embedding_dim, hidden_dim, n_layers, dropout=dropout, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, src):
-        embedded = self.dropout(self.embedding(src))
-        outputs, (hidden, cell) = self.rnn(embedded)
-        return outputs, hidden, cell
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = F.gelu
 
-class Decoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
+    def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        src2 = self.self_attn(src, src, src, attn_mask=src_mask)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+class DiacriticsRestorer(nn.Module):
+    def __init__(self, 
+                 vocab_size: int,
+                 d_model: int = 256,
+                 nhead: int = 8,
+                 num_encoder_layers: int = 6,
+                 dim_feedforward: int = 1024,
+                 dropout: float = 0.1,
+                 max_len: int = 512):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size + 1, embedding_dim)  # +1 for padding
-        self.rnn = nn.LSTM(embedding_dim, hidden_dim, n_layers, dropout=dropout, batch_first=True)
-        self.fc_out = nn.Linear(hidden_dim, vocab_size + 1)  # +1 for padding
+        
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, max_len)
+        
+        encoder_layers = [
+            TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_encoder_layers)
+        ]
+        self.encoder_layers = nn.ModuleList(encoder_layers)
+        
         self.dropout = nn.Dropout(dropout)
+        self.output_projection = nn.Linear(d_model, vocab_size)
         
-    def forward(self, input, hidden, cell):
-        input = input.unsqueeze(1)
-        embedded = self.dropout(self.embedding(input))
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
-        prediction = self.fc_out(output.squeeze(1))
-        return prediction, hidden, cell
-
-class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.device = device
-        
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        batch_size = src.shape[0]
-        trg_len = trg.shape[1]
-        trg_vocab_size = self.decoder.fc_out.out_features
-        
-        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
-        
-        # Encoder
-        encoder_outputs, hidden, cell = self.encoder(src)
-        
-        # First decoder input is first target token
-        decoder_input = trg[:, 0]
-        
-        for t in range(1, trg_len):
-            output, hidden, cell = self.decoder(decoder_input, hidden, cell)
-            outputs[:, t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            top1 = output.argmax(1)
-            decoder_input = trg[:, t] if teacher_force else top1
-        
-        return outputs
-
-def train_model(model, train_loader, optimizer, criterion, device, clip=1):
-    model.train()
-    epoch_loss = 0
+        # Initialize parameters
+        self._init_parameters()
     
-    for batch in train_loader:
-        src, trg = batch
-        src = src.to(device)
-        trg = trg.to(device)
+    def _init_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    
+    def generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+    
+    def forward(self, src: torch.Tensor) -> torch.Tensor:
+        # src shape: [batch_size, seq_len]
+        
+        # Create attention mask
+        src_mask = self.generate_square_subsequent_mask(src.size(1)).to(src.device)
+        
+        # Embedding and positional encoding
+        x = self.embedding(src) * math.sqrt(self.d_model)
+        x = self.pos_encoder(x.transpose(0, 1)).transpose(0, 1)
+        x = self.dropout(x)
+        
+        # Encoder layers
+        for layer in self.encoder_layers:
+            x = layer(x, src_mask)
+        
+        # Output projection
+        output = self.output_projection(x)
+        return output
+
+def train_epoch(model: nn.Module,
+                dataloader: DataLoader,
+                optimizer: torch.optim.Optimizer,
+                criterion: nn.Module,
+                device: torch.device) -> float:
+    model.train()
+    total_loss = 0
+    
+    for batch_idx, (src, tgt) in enumerate(dataloader):
+        src, tgt = src.to(device), tgt.to(device)
         
         optimizer.zero_grad()
+        output = model(src)
         
-        # Forward pass
-        output = model(src, trg)
-        
-        # Reshape output and target for loss calculation
-        output_dim = output.shape[-1]
-        output = output[:, 1:].contiguous().view(-1, output_dim)  # Skip first token
-        trg = trg[:, 1:].contiguous().view(-1)  # Skip first token
-        
-        # Calculate loss
-        loss = criterion(output, trg)
-        
-        # Backward pass
+        loss = criterion(output.view(-1, output.size(-1)), tgt.view(-1))
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
+        total_loss += loss.item()
         
-        epoch_loss += loss.item()
-    
-    return epoch_loss / len(train_loader)
+    return total_loss / len(dataloader)
 
-def restore_diacritics(model, text, dataset, device):
+def validate(model: nn.Module,
+            dataloader: DataLoader,
+            criterion: nn.Module,
+            device: torch.device) -> float:
     model.eval()
+    total_loss = 0
+    
     with torch.no_grad():
-        # Convert input text to lowercase and then to indices
-        text = text.lower()
-        input_indices = [dataset.char_to_idx[c] for c in text]
-        src = torch.tensor(input_indices).unsqueeze(0).to(device)
-        
-        # Initialize output with first character
-        output_chars = [text[0]]
-        decoder_input = src[:, 0]
-        
-        # Get encoder outputs
-        encoder_outputs, hidden, cell = model.encoder(src)
-        
-        # Generate rest of the sequence
-        max_length = len(text) * 2  # Prevent infinite loop while allowing for extra diacritics
-        
-        for t in range(1, max_length):
-            # Get decoder output
-            output, hidden, cell = model.decoder(decoder_input, hidden, cell)
-            
-            # Get best prediction and add to output
-            top1 = output.argmax(1)
-            pred_char = dataset.idx_to_char[top1.item()]
-            
-            # Add prediction to output
-            output_chars.append(pred_char)
-            
-            # Use prediction as next input
-            decoder_input = top1
-            
-            # Stop if we've generated enough characters
-            if len(output_chars) >= len(text) and pred_char in {'.', '!', '?'}:
-                break
-                
-    return ''.join(output_chars)
+        for src, tgt in dataloader:
+            src, tgt = src.to(device), tgt.to(device)
+            output = model(src)
+            loss = criterion(output.view(-1, output.size(-1)), tgt.view(-1))
+            total_loss += loss.item()
+    
+    return total_loss / len(dataloader)
+
+@torch.no_grad()
+def restore_diacritics(model: nn.Module,
+                      text: str,
+                      dataset: KyrgyzTextDataset,
+                      device: torch.device) -> str:
+    model.eval()
+    
+    # Prepare input
+    input_indices = [dataset.bos_idx] + [dataset.char_to_idx.get(c, dataset.unk_idx) for c in text.lower()] + [dataset.eos_idx]
+    input_tensor = torch.tensor(input_indices).unsqueeze(0).to(device)  # Add batch dimension
+    
+    # Generate output
+    output = model(input_tensor)
+    predictions = output.argmax(dim=-1)
+    
+    # Convert predictions to text
+    result = []
+    for idx in predictions[0]:  # Remove batch dimension
+        char = dataset.idx_to_char[idx.item()]
+        if char not in dataset.special_tokens:
+            result.append(char)
+    
+    return ''.join(result)
