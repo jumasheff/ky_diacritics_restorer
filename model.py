@@ -17,26 +17,29 @@ class KyrgyzTextDataset(Dataset):
         
         # Read data and build vocabulary
         with open(file_path, 'r', encoding='utf-8') as f:
+            next(f)  # Skip header if present
             for line in f:
-                if '|' in line:
-                    target, input_text = line.strip().split('|')
-                    target = target.strip()
-                    input_text = input_text.strip()
-                    self.input_texts.append(input_text)
-                    self.target_texts.append(target)
-                    
-                    # Update vocabulary
-                    for char in input_text + target:
-                        if char not in self.char_to_idx:
-                            idx = len(self.char_to_idx)
-                            self.char_to_idx[char] = idx
-                            self.idx_to_char[idx] = char
+                if '\t' in line:  
+                    fields = line.strip().split('\t')
+                    if len(fields) >= 2:  
+                        target = fields[1].strip()  
+                        input_text = fields[2].strip() if len(fields) > 2 else target  
+                        self.input_texts.append(input_text)
+                        self.target_texts.append(target)
+                        
+                        # Update vocabulary
+                        for char in input_text + target:
+                            if char not in self.char_to_idx:
+                                idx = len(self.char_to_idx)
+                                self.char_to_idx[char] = idx
+                                self.idx_to_char[idx] = char
         
         self.vocab_size = len(self.char_to_idx)
         self.pad_idx = self.vocab_size  # Set pad_idx for both instance and class
         KyrgyzTextDataset.pad_idx = self.vocab_size  # Set the class variable
         self.char_to_idx['<PAD>'] = self.pad_idx
         self.idx_to_char[self.pad_idx] = '<PAD>'
+        print(f"Vocab: {self.char_to_idx.keys()}")
         
     def __len__(self):
         return len(self.input_texts)
@@ -138,19 +141,25 @@ def train_model(model, train_loader, optimizer, criterion, device, clip=1):
         trg = trg.to(device)
         
         optimizer.zero_grad()
+        
+        # Forward pass
         output = model(src, trg)
         
+        # Reshape output and target for loss calculation
         output_dim = output.shape[-1]
-        output = output.contiguous().view(-1, output_dim)
-        trg = trg.contiguous().view(-1)
+        output = output[:, 1:].contiguous().view(-1, output_dim)  # Skip first token
+        trg = trg[:, 1:].contiguous().view(-1)  # Skip first token
         
+        # Calculate loss
         loss = criterion(output, trg)
+        
+        # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         optimizer.step()
         
         epoch_loss += loss.item()
-        
+    
     return epoch_loss / len(train_loader)
 
 def restore_diacritics(model, text, dataset, device):
@@ -160,22 +169,32 @@ def restore_diacritics(model, text, dataset, device):
         input_indices = [dataset.char_to_idx[c] for c in text]
         src = torch.tensor(input_indices).unsqueeze(0).to(device)
         
-        # Encoder
-        encoder_outputs, hidden, cell = model.encoder(src)
-        
-        # Initialize decoder input
+        # Initialize output with first character
+        output_chars = [text[0]]
         decoder_input = src[:, 0]
         
-        output_chars = []
-        max_length = len(text) + 50  # Prevent infinite loop
+        # Get encoder outputs
+        encoder_outputs, hidden, cell = model.encoder(src)
         
-        for _ in range(max_length):
+        # Generate rest of the sequence
+        max_length = len(text) * 2  # Prevent infinite loop while allowing for extra diacritics
+        
+        for t in range(1, max_length):
+            # Get decoder output
             output, hidden, cell = model.decoder(decoder_input, hidden, cell)
+            
+            # Get best prediction and add to output
             top1 = output.argmax(1)
-            output_chars.append(dataset.idx_to_char[top1.item()])
+            pred_char = dataset.idx_to_char[top1.item()]
+            
+            # Add prediction to output
+            output_chars.append(pred_char)
+            
+            # Use prediction as next input
             decoder_input = top1
             
-            if len(output_chars) >= len(text):
+            # Stop if we've generated enough characters
+            if len(output_chars) >= len(text) and pred_char in {'.', '!', '?'}:
                 break
                 
     return ''.join(output_chars)

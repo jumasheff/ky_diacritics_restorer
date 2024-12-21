@@ -10,16 +10,20 @@ def main():
     HIDDEN_DIM = 512
     N_LAYERS = 2
     DROPOUT = 0.2
-    BATCH_SIZE = 32
+    BATCH_SIZE = 32  # Reduced from 128 to handle varying sequence lengths better
     N_EPOCHS = 100
     LEARNING_RATE = 0.001
     
     # Device configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
     # Load dataset
-    dataset = KyrgyzTextDataset('dataset.tsv')
+    dataset = KyrgyzTextDataset('example_dataset.tsv')
     train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=KyrgyzTextDataset.collate_fn)
+    
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Vocabulary size: {dataset.vocab_size}")
     
     # Initialize model
     encoder = Encoder(dataset.vocab_size + 1, EMBEDDING_DIM, HIDDEN_DIM, N_LAYERS, DROPOUT)
@@ -32,7 +36,7 @@ def main():
     
     # Training loop
     best_loss = float('inf')
-    for epoch in range(N_EPOCHS):
+    for epoch in tqdm(range(N_EPOCHS), desc="Training"):
         loss = train_model(model, train_loader, optimizer, criterion, device)
         print(f'Epoch: {epoch+1}, Loss: {loss:.4f}')
         
@@ -51,10 +55,11 @@ def main():
                 "Бугун кун ысык."
             ]
             print("\nTesting examples:")
-            for sent in test_sentences:
-                restored = restore_diacritics(model, sent, dataset, device)
-                print(f'Input: {sent}')
-                print(f'Output: {restored}\n')
+            with torch.no_grad():
+                for sent in test_sentences:
+                    restored = restore_diacritics(model, sent, dataset, device)
+                    print(f'Input: {sent}')
+                    print(f'Output: {restored}\n')
 
 if __name__ == "__main__":
     main()
