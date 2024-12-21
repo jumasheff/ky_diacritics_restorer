@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from model import KyrgyzTextDataset, DiacriticsRestorer
+from model import KyrgyzTextDataset, DiacriticsRestorer, restore_diacritics
 import matplotlib.pyplot as plt
 from tqdm.notebook import tqdm
 import os
