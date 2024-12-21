@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 from typing import List, Dict, Tuple, Optional
 import math
+import random
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 5000):
@@ -24,10 +25,23 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:x.size(0)]
 
 class KyrgyzTextDataset(Dataset):
-    def __init__(self, file_path: str, max_len: int = 512):
+    def __init__(self, file_path: str, max_len: int = 512, sample_ratio: float = 1.0, val_ratio: float = 0.1, seed: int = 42):
+        """
+        Initialize the dataset.
+        
+        Args:
+            file_path (str): Path to the TSV file
+            max_len (int): Maximum sequence length
+            sample_ratio (float): Ratio of data to use (0.0 to 1.0)
+            val_ratio (float): Ratio of data to use for validation
+            seed (int): Random seed for reproducibility
+        """
         self.input_texts = []
         self.target_texts = []
         self.max_len = max_len
+        
+        # Set random seed for reproducibility
+        random.seed(seed)
         
         # Special tokens
         self.special_tokens = ['<PAD>', '<UNK>', '<BOS>', '<EOS>']
@@ -39,10 +53,22 @@ class KyrgyzTextDataset(Dataset):
         self.bos_idx = self.char_to_idx['<BOS>']
         self.eos_idx = self.char_to_idx['<EOS>']
         
-        # Read data and build vocabulary
+        # Read all data first
+        all_input_texts = []
+        all_target_texts = []
+        
         with open(file_path, 'r', encoding='utf-8') as f:
             next(f)  # Skip header
-            for line in f:
+            lines = f.readlines()
+            
+            # Shuffle lines
+            random.shuffle(lines)
+            
+            # Calculate how many lines to use based on sample_ratio
+            num_lines = int(len(lines) * sample_ratio)
+            lines = lines[:num_lines]
+            
+            for line in lines:
                 if '\t' in line:
                     fields = line.strip().split('\t')
                     if len(fields) >= 2:
@@ -50,8 +76,8 @@ class KyrgyzTextDataset(Dataset):
                         input_text = fields[2].strip().lower() if len(fields) > 2 else target
                         
                         if len(input_text) <= max_len - 2:  # -2 for BOS and EOS
-                            self.input_texts.append(input_text)
-                            self.target_texts.append(target)
+                            all_input_texts.append(input_text)
+                            all_target_texts.append(target)
                             
                             # Update vocabulary
                             for char in input_text + target:
@@ -61,13 +87,41 @@ class KyrgyzTextDataset(Dataset):
                                     self.idx_to_char[idx] = char
         
         self.vocab_size = len(self.char_to_idx)
+        
+        # Store dataset statistics
+        self.total_samples = len(all_input_texts)
+        self.used_samples = int(self.total_samples * sample_ratio)
+        
+        # Split into train and validation sets
+        val_size = int(len(all_input_texts) * val_ratio)
+        train_size = len(all_input_texts) - val_size
+        
+        self.train_indices = list(range(train_size))
+        self.val_indices = list(range(train_size, len(all_input_texts)))
+        
+        self.input_texts = all_input_texts
+        self.target_texts = all_target_texts
+        
+        self.is_train = True  # Flag to switch between train and validation sets
+    
+    def set_split(self, is_train: bool = True):
+        """Switch between train and validation sets"""
+        self.is_train = is_train
     
     def __len__(self) -> int:
-        return len(self.input_texts)
+        if self.is_train:
+            return len(self.train_indices)
+        return len(self.val_indices)
     
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_text = self.input_texts[idx]
-        target_text = self.target_texts[idx]
+        # Map idx to the correct index based on split
+        if self.is_train:
+            actual_idx = self.train_indices[idx]
+        else:
+            actual_idx = self.val_indices[idx]
+        
+        input_text = self.input_texts[actual_idx]
+        target_text = self.target_texts[actual_idx]
         
         # Convert to indices with BOS and EOS tokens
         input_indices = [self.bos_idx] + [self.char_to_idx.get(c, self.unk_idx) for c in input_text] + [self.eos_idx]
@@ -79,6 +133,27 @@ class KyrgyzTextDataset(Dataset):
         
         return (torch.tensor(input_indices[:self.max_len], dtype=torch.long),
                 torch.tensor(target_indices[:self.max_len], dtype=torch.long))
+    
+    def get_splits(self):
+        """Return two dataset objects for train and validation"""
+        train_dataset = KyrgyzTextDataset(self.file_path, self.max_len)
+        train_dataset.set_split(True)
+        
+        val_dataset = KyrgyzTextDataset(self.file_path, self.max_len)
+        val_dataset.set_split(False)
+        
+        return train_dataset, val_dataset
+    
+    def get_dataset_info(self) -> Dict:
+        """Return information about the dataset"""
+        return {
+            'total_samples': self.total_samples,
+            'used_samples': self.used_samples,
+            'train_samples': len(self.train_indices),
+            'val_samples': len(self.val_indices),
+            'vocab_size': self.vocab_size,
+            'max_len': self.max_len
+        }
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1):
