@@ -1,0 +1,1 @@
+Let's say a model tries to predict if it should be о or ө. In this case we don't have to go through the whole vocabulary, that is, it's either only ө or о, and not к, and not ү.
