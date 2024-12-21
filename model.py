@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
+import math
 
 class KyrgyzTextDataset(Dataset):
     def __init__(self, file_path):
@@ -15,20 +16,18 @@ class KyrgyzTextDataset(Dataset):
         
         # Read data and build vocabulary
         with open(file_path, 'r', encoding='utf-8') as f:
+            next(f)  # Skip header
             for line in f:
-                if '|' in line:
-                    target, input_text = line.strip().split('|')
-                    target = target.strip()
-                    input_text = input_text.strip()
-                    self.input_texts.append(input_text)
-                    self.target_texts.append(target)
-                    
-                    # Update vocabulary
-                    for char in input_text + target:
-                        if char not in self.char_to_idx:
-                            idx = len(self.char_to_idx)
-                            self.char_to_idx[char] = idx
-                            self.idx_to_char[idx] = char
+                id_, source, target = line.strip().split('\t')
+                self.input_texts.append(source)
+                self.target_texts.append(target)
+                
+                # Update vocabulary
+                for char in source + target:
+                    if char not in self.char_to_idx:
+                        idx = len(self.char_to_idx)
+                        self.char_to_idx[char] = idx
+                        self.idx_to_char[idx] = char
         
         self.vocab_size = len(self.char_to_idx)
         self.pad_idx = self.vocab_size
@@ -53,61 +52,59 @@ class KyrgyzTextDataset(Dataset):
             'target_text': target_text
         }
 
-class Encoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size + 1, embedding_dim)  # +1 for padding
-        self.rnn = nn.LSTM(embedding_dim, hidden_dim, n_layers, dropout=dropout, batch_first=True)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+class TransformerDiacriticsRestorer(nn.Module):
+    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Character embedding
+        self.embedding = nn.Embedding(vocab_size + 1, d_model)  # +1 for padding
+        self.pos_encoder = PositionalEncoding(d_model)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Output layer
+        self.output_layer = nn.Linear(d_model, vocab_size + 1)  # +1 for padding
+        
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, src):
-        embedded = self.dropout(self.embedding(src))
-        outputs, (hidden, cell) = self.rnn(embedded)
-        return outputs, hidden, cell
+    def forward(self, src, src_mask=None, src_padding_mask=None):
+        # Embed characters and add positional encoding
+        src = self.embedding(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        src = self.dropout(src)
+        
+        # Transform through encoder
+        output = self.transformer_encoder(src, src_mask, src_padding_mask)
+        
+        # Project to vocabulary size
+        output = self.output_layer(output)
+        return output
 
-class Decoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, n_layers, dropout):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size + 1, embedding_dim)  # +1 for padding
-        self.rnn = nn.LSTM(embedding_dim, hidden_dim, n_layers, dropout=dropout, batch_first=True)
-        self.fc_out = nn.Linear(hidden_dim, vocab_size + 1)  # +1 for padding
-        self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, input, hidden, cell):
-        input = input.unsqueeze(1)
-        embedded = self.dropout(self.embedding(input))
-        output, (hidden, cell) = self.rnn(embedded, (hidden, cell))
-        prediction = self.fc_out(output.squeeze(1))
-        return prediction, hidden, cell
-
-class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
-        super().__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.device = device
-        
-    def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        batch_size = src.shape[0]
-        trg_len = trg.shape[1]
-        trg_vocab_size = self.decoder.fc_out.out_features
-        
-        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(self.device)
-        
-        # Encoder
-        encoder_outputs, hidden, cell = self.encoder(src)
-        
-        # First decoder input is first target token
-        decoder_input = trg[:, 0]
-        
-        for t in range(1, trg_len):
-            output, hidden, cell = self.decoder(decoder_input, hidden, cell)
-            outputs[:, t] = output
-            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
-            top1 = output.argmax(1)
-            decoder_input = trg[:, t] if teacher_force else top1
-            
-        return outputs
+def create_padding_mask(seq, pad_idx):
+    return seq == pad_idx
 
 def train_model(model, train_loader, optimizer, criterion, device, clip=1):
     model.train()
@@ -117,14 +114,23 @@ def train_model(model, train_loader, optimizer, criterion, device, clip=1):
         src = batch['input'].to(device)
         trg = batch['target'].to(device)
         
+        # Create padding mask
+        padding_mask = create_padding_mask(src, model.embedding.num_embeddings - 1)
+        
         optimizer.zero_grad()
-        output = model(src, trg)
         
+        # Forward pass
+        output = model(src, src_padding_mask=padding_mask)
+        
+        # Reshape output and target for loss calculation
         output_dim = output.shape[-1]
-        output = output[:, 1:].reshape(-1, output_dim)
-        trg = trg[:, 1:].reshape(-1)
+        output = output.reshape(-1, output_dim)
+        trg = trg.reshape(-1)
         
+        # Calculate loss
         loss = criterion(output, trg)
+        
+        # Backward pass
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         optimizer.step()
@@ -140,22 +146,13 @@ def restore_diacritics(model, text, dataset, device):
         input_indices = [dataset.char_to_idx[c] for c in text]
         src = torch.tensor(input_indices).unsqueeze(0).to(device)
         
-        # Encoder
-        encoder_outputs, hidden, cell = model.encoder(src)
+        # Forward pass through the model
+        output = model(src)
         
-        # Initialize decoder input
-        decoder_input = src[:, 0]
+        # Get predictions
+        predictions = output.argmax(dim=-1)
         
-        output_chars = []
-        max_length = len(text) + 50  # Prevent infinite loop
+        # Convert predictions to characters
+        output_chars = [dataset.idx_to_char[idx.item()] for idx in predictions[0]]
         
-        for _ in range(max_length):
-            output, hidden, cell = model.decoder(decoder_input, hidden, cell)
-            top1 = output.argmax(1)
-            output_chars.append(dataset.idx_to_char[top1.item()])
-            decoder_input = top1
-            
-            if len(output_chars) >= len(text):
-                break
-                
     return ''.join(output_chars)
