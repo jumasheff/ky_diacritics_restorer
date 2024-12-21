@@ -288,13 +288,30 @@ def restore_diacritics(model: nn.Module,
     
     # Generate output
     output = model(input_tensor)
-    predictions = output.argmax(dim=-1)
     
-    # Convert predictions to text
+    # Restrict predictions based on input character
     result = []
-    for idx in predictions[0]:  # Remove batch dimension
-        char = dataset.idx_to_char[idx.item()]
-        if char not in dataset.special_tokens:
+    for i, idx in enumerate(input_indices[1:-1]):  # Skip BOS and EOS
+        char = dataset.idx_to_char[idx]
+        
+        if char in ['о', 'у', 'н']:
+            if char == 'о':
+                candidates = [dataset.char_to_idx['о'], dataset.char_to_idx['ө']]
+            elif char == 'у':
+                candidates = [dataset.char_to_idx['у'], dataset.char_to_idx['ү']]
+            elif char == 'н':
+                candidates = [dataset.char_to_idx['н'], dataset.char_to_idx['ң']]
+            
+            # Mask all logits except candidates
+            mask = torch.full_like(output[:, i, :], float('-inf'))
+            for c in candidates:
+                mask[:, c] = 0
+            output[:, i, :] += mask
+            
+            pred_idx = output[:, i, :].argmax(dim=-1).item()
+            result.append(dataset.idx_to_char[pred_idx])
+        else:
+            # For non-ambiguous characters, use the original character
             result.append(char)
     
     return ''.join(result)
