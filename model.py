@@ -17,17 +17,17 @@ class KyrgyzTextDataset(Dataset):
         
         # Read data and build vocabulary
         with open(file_path, 'r', encoding='utf-8') as f:
-            next(f)  # Skip header if present
+            next(f)  # Skip header
             for line in f:
-                if '\t' in line:  
+                if '\t' in line:
                     fields = line.strip().split('\t')
-                    if len(fields) >= 2:  
-                        target = fields[1].strip()  
-                        input_text = fields[2].strip() if len(fields) > 2 else target  
+                    if len(fields) >= 2:
+                        target = fields[1].strip().lower()  # Convert to lowercase
+                        input_text = fields[2].strip().lower() if len(fields) > 2 else target  # Convert to lowercase
                         self.input_texts.append(input_text)
-                        self.target_texts.append(target)
+                        self.target_texts.append(target.lower())  # Convert to lowercase
                         
-                        # Update vocabulary
+                        # Update vocabulary (only lowercase)
                         for char in input_text + target:
                             if char not in self.char_to_idx:
                                 idx = len(self.char_to_idx)
@@ -35,12 +35,11 @@ class KyrgyzTextDataset(Dataset):
                                 self.idx_to_char[idx] = char
         
         self.vocab_size = len(self.char_to_idx)
-        self.pad_idx = self.vocab_size  # Set pad_idx for both instance and class
-        KyrgyzTextDataset.pad_idx = self.vocab_size  # Set the class variable
+        self.pad_idx = self.vocab_size
+        KyrgyzTextDataset.pad_idx = self.vocab_size
         self.char_to_idx['<PAD>'] = self.pad_idx
         self.idx_to_char[self.pad_idx] = '<PAD>'
-        print(f"Vocab: {self.char_to_idx.keys()}")
-        
+    
     def __len__(self):
         return len(self.input_texts)
     
@@ -128,7 +127,7 @@ class Seq2Seq(nn.Module):
             teacher_force = torch.rand(1).item() < teacher_forcing_ratio
             top1 = output.argmax(1)
             decoder_input = trg[:, t] if teacher_force else top1
-            
+        
         return outputs
 
 def train_model(model, train_loader, optimizer, criterion, device, clip=1):
@@ -165,7 +164,8 @@ def train_model(model, train_loader, optimizer, criterion, device, clip=1):
 def restore_diacritics(model, text, dataset, device):
     model.eval()
     with torch.no_grad():
-        # Convert input text to indices
+        # Convert input text to lowercase and then to indices
+        text = text.lower()
         input_indices = [dataset.char_to_idx[c] for c in text]
         src = torch.tensor(input_indices).unsqueeze(0).to(device)
         
