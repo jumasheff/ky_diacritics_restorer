@@ -1,6 +1,7 @@
 # Large data files
 all_texts.txt
 dataset.tsv
+ky_diacritics_dataset.zip
 
 # Python
 __pycache__/
