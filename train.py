@@ -5,8 +5,21 @@ from model import KyrgyzTextDataset, DiacriticsRestorer, restore_diacritics
 import matplotlib.pyplot as plt
 from tqdm.notebook import tqdm
 import os
+import wandb
 
-def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4):
+def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4, project_name="ky-diacritics-restorer"):
+    # Initialize wandb
+    wandb.init(
+        project=project_name,
+        config={
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "model_type": model.__class__.__name__,
+            "optimizer": "AdamW",
+        }
+    )
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -35,6 +48,9 @@ def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4):
     print(f"Vocabulary size: {info['vocab_size']}")
     print(f"Max sequence length: {info['max_len']}\n")
     
+    # Log dataset info to wandb
+    wandb.config.update(info)
+    
     for epoch in range(epochs):
         # Training
         dataset.set_split(is_train=True)
@@ -59,6 +75,9 @@ def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4):
             
             # Update progress bar
             train_progress.set_postfix({'loss': loss.item()})
+            
+            # Log batch loss to wandb
+            wandb.log({"batch_train_loss": loss.item()})
         
         avg_train_loss = total_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
@@ -83,6 +102,19 @@ def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4):
         val_losses.append(avg_val_loss)
         
         print(f'Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f}, Val Loss = {avg_val_loss:.4f}')
+        
+        # Log epoch metrics to wandb
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+        })
+        
+        # Save model checkpoint to wandb
+        if (epoch + 1) % 5 == 0:  # Save every 5 epochs
+            checkpoint_path = f"model_epoch_{epoch+1}.pt"
+            torch.save(model.state_dict(), checkpoint_path)
+            wandb.save(checkpoint_path)
     
     # Plot training history
     plt.figure(figsize=(10, 6))
@@ -93,6 +125,9 @@ def train(model, dataset, epochs=10, batch_size=32, learning_rate=1e-4):
     plt.title('Training History')
     plt.legend()
     plt.show()
+    
+    # Close wandb run
+    wandb.finish()
     
     return train_losses, val_losses
 
