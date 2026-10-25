@@ -291,7 +291,7 @@ def restore_diacritics(model: nn.Module,
     
     # Restrict predictions based on input character
     result = []
-    for i, idx in enumerate(input_indices[1:-1]):  # Skip BOS and EOS
+    for i, idx in enumerate(input_indices[1:-1], start=1):  # Match positions after BOS
         char = dataset.idx_to_char[idx]
         
         if char in ['о', 'у', 'н']:
